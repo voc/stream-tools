@@ -2,118 +2,14 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
-	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"net/url"
-	"path"
+	"os"
+	"os/signal"
 	"runtime"
-	"strconv"
-	"strings"
+	"syscall"
 	"time"
-
-	"github.com/zencoder/go-dash/mpd"
 )
-
-func segmentName(s *mpd.SegmentTimelineSegment, r *mpd.Representation, offset int64) string {
-	st := *r.SegmentTemplate
-	id := *r.ID
-	number := *st.StartNumber + offset
-	name := strings.ReplaceAll(*st.Media, "$RepresentationID$", id)
-	return strings.ReplaceAll(name, "$Number$", strconv.FormatInt(number, 10))
-}
-
-// parseMpd parses DASH manifest and queues the segment download tasks
-func parseMpd(ctx context.Context, reader io.Reader, u *url.URL, sample uint, tasks chan<- *Task) error {
-	manifest, err := mpd.Read(reader)
-	if err != nil {
-		return err
-	}
-
-	avStart := *manifest.AvailabilityStartTime
-	startTime, err := time.Parse(time.RFC3339, avStart)
-	if err != nil {
-		return err
-	}
-
-	presentationDelay := time.Second * 3
-	if manifest.SuggestedPresentationDelay != nil {
-		presentationDelay = time.Duration(*manifest.SuggestedPresentationDelay)
-	}
-	// all segments after that shall not be downloaded in this iteration
-	presentationEdge := time.Now().Add(-presentationDelay)
-
-	period := manifest.Periods[0]
-	for _, as := range period.AdaptationSets {
-		for _, representation := range as.Representations {
-			offset := int64(0)
-			timestamp := uint64(0)
-
-			// Just support segmenttimeline for now
-			template := representation.SegmentTemplate
-			timescale := *template.Timescale
-			timeline := template.SegmentTimeline
-
-			for _, segment := range timeline.Segments {
-				if segment.StartTime != nil {
-					timestamp = *segment.StartTime
-				}
-
-				repeat := 0
-				if segment.RepeatCount != nil {
-					repeat = *segment.RepeatCount
-				}
-
-				for n := 0; n < repeat+1; n++ {
-					name := segmentName(segment, representation, offset)
-					segmentURL := fmt.Sprintf("%s://%s%s/%s", u.Scheme, u.Host, path.Dir(u.Path), name)
-					ts := startTime.Add(time.Duration(int64(timestamp)/timescale) * time.Second)
-					if presentationEdge.After(ts) && offset%int64(sample) == 0 {
-						task := &Task{URL: segmentURL, Context: ctx}
-						select {
-						case <-ctx.Done():
-							return errors.New("Rate Limit reached")
-						case tasks <- task:
-						}
-					}
-					offset++
-					timestamp += segment.Duration
-				}
-			}
-		}
-	}
-	return nil
-}
-
-func parseM3u8(ctx context.Context, reader io.Reader, u *url.URL, sample uint, tasks chan<- *Task) error {
-	return nil
-}
-
-func get(parent context.Context, urlString string, interval time.Duration, sample uint, tasks chan<- *Task) error {
-	u, err := url.Parse(urlString)
-	if err != nil {
-		return err
-	}
-	resp, err := http.Get(urlString)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	deadline := time.Now().Add(interval)
-	ctx, _ := context.WithDeadline(parent, deadline)
-	switch path.Ext(u.Path) {
-	case ".mpd":
-		return parseMpd(ctx, resp.Body, u, sample, tasks)
-	case ".m3u8":
-		return parseM3u8(ctx, resp.Body, u, sample, tasks)
-	default:
-		return fmt.Errorf("Unknown playlist format: '%v' for %v", path.Ext(u.Path), urlString)
-	}
-}
 
 func main() {
 	var segmentDuration = flag.Duration("segment-duration", time.Second*3, "segment duration")
@@ -122,17 +18,21 @@ func main() {
 	var sample = flag.Uint("sample", 5, "segments between simulated clients")
 	flag.Parse()
 	urls := flag.Args()
+	log.Printf("Fetching from %d playlist\n", len(urls))
 
-	tasks := make(chan *Task)
-	limiter := make(chan struct{}, 1)
+	tasks := make(chan *Task, 1)
+	limiter := make(chan struct{}, *numWorkers)
 	results := make(chan *Result, 1)
-	ctx, _ := context.WithCancel(context.Background())
+	iteration := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Source routine
 	go func() {
 		ticker := time.NewTicker(*segmentDuration)
+		pl := NewPlaylistLoader(*sample, tasks, *segmentDuration)
 		for {
 			for _, URL := range urls {
-				err := get(ctx, URL, *segmentDuration, *sample, tasks)
+				err := pl.Load(ctx, URL)
 				if err != nil {
 					log.Println(err)
 				}
@@ -141,6 +41,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				iteration <- struct{}{}
 			}
 		}
 	}()
@@ -148,20 +49,28 @@ func main() {
 	// Stats routine
 	count := make(chan uint64, 1)
 	go func() {
-		ticker := time.NewTicker(*segmentDuration)
-		hits, errors, bytes := uint64(0), uint64(0), int64(0)
+		hits, timeouts, errors := uint64(0), uint64(0), uint64(0)
+		last := time.Now()
+		bytes := int64(0)
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				log.Printf("success: %d, error: %d, rate: %0.2f Mbit/s", hits, errors, float64(bytes)/1048576*8)
+			case <-iteration:
+				now := time.Now()
+				timeFactor := float64(now.Sub(last) / time.Second)
+				last = now
+				bits := float64(bytes) / 1048576 * 8 / timeFactor
+				log.Printf("success: %d, timeouts: %d, error: %d, rate: %0.2f Mbit/s", hits, timeouts, errors, bits)
 				count <- uint64(hits + errors)
-				hits, errors, bytes = 0, 0, 0
+				hits, timeouts, errors = 0, 0, 0
+				bytes = 0
 			case res := <-results:
 				bytes += res.Loaded
 				if res.Err != nil {
-					if res.Err != context.DeadlineExceeded {
+					if res.Err == context.DeadlineExceeded {
+						timeouts++
+					} else {
 						log.Println("Request error:", res.Err)
 						errors++
 					}
@@ -180,14 +89,19 @@ func main() {
 			return
 		} else if *limit == -1 {
 			auto = true
-			*limit = 50
+			*limit = int64(len(urls) * 50 / int(*sample))
 		}
 		ticker := time.NewTicker(time.Second / time.Duration(*limit))
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case <-ticker.C:
 				limiter <- struct{}{}
 			case total := <-count:
+				if total < 50 {
+					total = 50
+				}
 				if auto {
 					ticker.Stop()
 					ticker = time.NewTicker(time.Second / time.Duration(float32(total)*1.2))
@@ -198,7 +112,24 @@ func main() {
 
 	// Spawn workers
 	for i := 0; i < *numWorkers; i++ {
-		go NewDownloader(*segmentDuration, tasks, limiter, results)
+		go NewDownloader(ctx, *segmentDuration, tasks, limiter, results)
 	}
-	<-ctx.Done()
+
+	// signal handling
+	c := make(chan os.Signal, 1)
+	signal.Notify(c,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM)
+
+	for {
+		sig := <-c
+		log.Println("Caught signal", sig)
+		if sig != syscall.SIGHUP {
+			// Wait for shutdown
+			cancel()
+			time.Sleep(200 * time.Millisecond)
+			return
+		}
+	}
 }
