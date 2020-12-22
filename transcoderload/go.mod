@@ -1,3 +1,3 @@
 module github.com/voc/stream-tools/transcoderload
 
-go 1.15
+go 1.14

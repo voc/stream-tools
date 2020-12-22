@@ -101,7 +101,8 @@ func (j *Job) handleConnection(conn net.Conn) {
 }
 
 func (j *Job) start(exitNotify chan<- struct{}) {
-	j.wg.Add(1)
+	// start process in new group group
+	j.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 	j.cmd.Stdout = os.Stdout
 	j.cmd.Stderr = os.Stderr
 
@@ -109,7 +110,8 @@ func (j *Job) start(exitNotify chan<- struct{}) {
 	if err != nil {
 		log.Println(err)
 	}
-	defer j.cmd.Process.Signal(syscall.SIGTERM)
+	// kill process group
+	defer syscall.Kill(-j.cmd.Process.Pid, syscall.SIGTERM)
 
 	// stop job if command ends
 	go func() {
@@ -155,6 +157,7 @@ func launch(parentCtx context.Context, name string, dirname string, cmd string, 
 		}
 		job.handleConnection(conn)
 	}()
+	job.wg.Add(1)
 	go job.start(exitNotify)
 
 	return &job, nil

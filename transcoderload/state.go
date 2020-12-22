@@ -29,10 +29,10 @@ func NewEstimator() *Estimator {
 
 func (e *Estimator) Stall() {
 	e.buckets[e.index] = e.buckets[e.index] - e.weight
-	if e.index < 3 {
-		e.index = 1
+	if e.index < 1 {
+		e.index = 0
 	} else {
-		e.index = e.index - 2
+		e.index = e.index - 1
 	}
 	e.weight = e.weight * 2
 }

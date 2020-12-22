@@ -8,12 +8,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
 
-func run(ctx context.Context, dirname string, cmd string) {
+func run(ctx context.Context, wg *sync.WaitGroup, dirname string, cmd string) {
 	estimator := NewEstimator()
+	defer wg.Done()
 	defer estimator.PrintStats()
 
 	n := 1
@@ -44,8 +46,14 @@ func run(ctx context.Context, dirname string, cmd string) {
 		select {
 		case <-ctx.Done():
 			// exit
+			for i := 0; i < len(jobs); i++ {
+				jobs[i].Stop()
+			}
 			return
 		case <-notify:
+			if !timer.Stop() {
+				<-timer.C
+			}
 			// job did stall
 			for i := 0; i < len(jobs); i++ {
 				jobs[i].Stop()
@@ -78,7 +86,9 @@ func main() {
 	}
 
 	// run ffmpegs
-	go run(ctx, dirname, *cmd)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go run(ctx, &wg, dirname, *cmd)
 
 	// signal handling
 	c := make(chan os.Signal, 1)
@@ -98,6 +108,7 @@ func main() {
 		}
 		// Cleanup
 		cancel()
+		wg.Wait()
 		os.RemoveAll(dirname)
 		return
 	}
