@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"io/ioutil"
 	"log"
 	"os"
@@ -11,68 +12,65 @@ import (
 	"time"
 )
 
-func run(ctx context.Context, dirname string) {
-	estimator := Estimator{}
+func run(ctx context.Context, dirname string, cmd string) {
+	estimator := NewEstimator()
 	defer estimator.PrintStats()
 
 	n := 1
-	count := 0
-	ticker := time.NewTicker(20 * time.Second)
-	overload := make(chan Overload)
+	timer := time.NewTimer(time.Second)
+	timer.Stop()
+	notify := make(chan struct{}, 1)
 	var jobs []*Job
 	for {
-		if count == 0 {
-			count++
-			estimator.Grow()
-		}
+		count, holdTime := estimator.Cycle()
 		diff := count - len(jobs)
-		log.Println("count", count, "diff", diff)
+		log.Printf("count: %d, diff: %d, hold: %v", count, diff, holdTime)
 
-		if diff > 0 {
-			for i := 0; i < diff; i++ {
-				// increase jobs
-				name := "ffmpeg" + strconv.Itoa(n)
-				n++
-				job, err := launch(ctx, name, dirname, overload)
-				if err != nil {
-					log.Fatal(err)
-				}
-				jobs = append(jobs, job)
-				log.Println("launched")
+		for i := 0; i < diff; i++ {
+			// increase jobs
+			name := "ffmpeg" + strconv.Itoa(n)
+			n++
+			job, err := launch(ctx, name, dirname, cmd, notify)
+			if err != nil {
+				log.Fatal(err)
 			}
-
-		} else {
-			// decrease jobs
-			for i := 0; i < -diff; i++ {
-				jobs[len(jobs)-1-i].Stop()
-			}
+			jobs = append(jobs, job)
+			log.Println("launched")
+			time.Sleep(time.Second)
 		}
 
-		// wait or exit
+		timer.Reset(holdTime)
+
 		select {
 		case <-ctx.Done():
+			// exit
 			return
-		case <-ticker.C:
-		}
-
-		var remain []*Job
-		for _, job := range jobs {
-			if job.Running() {
-				remain = append(remain, job)
+		case <-notify:
+			// job did stall
+			for i := 0; i < len(jobs); i++ {
+				jobs[i].Stop()
 			}
+			jobs = []*Job{}
+			// drain notify
+			select {
+			case <-notify:
+			default:
+			}
+			estimator.Stall()
+			estimator.PrintStats()
+			continue
+		case <-timer.C:
+			// cycle ended without stall
 		}
-		if len(remain) == count {
-			count++
-			estimator.Grow()
-		} else {
-			estimator.Stall(count)
-			count = len(remain)
-		}
-		jobs = remain
+		estimator.Grow()
+		estimator.PrintStats()
 	}
 }
 
 func main() {
+	var cmd = flag.String("cmd", "ffmpeg", "command")
+	flag.Parse()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	dirname, err := ioutil.TempDir(os.TempDir(), "*")
 	if err != nil {
@@ -80,7 +78,7 @@ func main() {
 	}
 
 	// run ffmpegs
-	go run(ctx, dirname)
+	go run(ctx, dirname, *cmd)
 
 	// signal handling
 	c := make(chan os.Signal, 1)
@@ -90,14 +88,17 @@ func main() {
 		syscall.SIGTERM)
 
 	for {
-		sig := <-c
-		log.Println("Caught signal", sig)
-		if sig != syscall.SIGHUP {
-			// Wait for shutdown
-			cancel()
-			time.Sleep(200 * time.Millisecond)
-			os.RemoveAll(dirname)
-			return
+		select {
+		case sig := <-c:
+			log.Println("Caught signal", sig)
+			if sig == syscall.SIGHUP {
+				continue
+			}
+		case <-ctx.Done():
 		}
+		// Cleanup
+		cancel()
+		os.RemoveAll(dirname)
+		return
 	}
 }

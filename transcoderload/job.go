@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -11,26 +12,29 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 )
 
 type Job struct {
 	Name       string
+	ctx        context.Context
 	cancel     func()
 	stopped    bool
 	stallCount int
 	lastSpeed  float64
+	cmd        *exec.Cmd
+	wg         sync.WaitGroup
 }
 
 func (j *Job) Stop() {
-	j.stopped = true
 	j.cancel()
+	j.wg.Wait()
 }
 
 func (j *Job) Running() bool {
 	return !j.stopped
 }
-
-type Overload struct{}
 
 func (j *Job) parseSpeed(status map[string]string) {
 	speed, ok := status["speed"]
@@ -38,7 +42,6 @@ func (j *Job) parseSpeed(status map[string]string) {
 		return
 	}
 	if speed == "N/A" {
-		// log.Println("skip N/A")
 		j.stallCount++
 		return
 	}
@@ -50,7 +53,6 @@ func (j *Job) parseSpeed(status map[string]string) {
 		return
 	}
 	if fspeed < 1 && j.lastSpeed > fspeed {
-		log.Println("speed", fspeed)
 		j.stallCount++
 	} else {
 		j.stallCount = 0
@@ -73,37 +75,67 @@ func (j *Job) parseStatus(content string, status map[string]string) error {
 	return nil
 }
 
-func handleConnection(conn net.Conn, job *Job, overload <-chan Overload) {
+func (j *Job) handleConnection(conn net.Conn) {
 	buf := make([]byte, 2048)
 	status := make(map[string]string)
-	defer job.Stop()
+	defer j.cancel()
 	for {
 		length, err := conn.Read(buf)
 		if err != nil {
 			if err != io.EOF {
 				log.Println("read failed:", err)
 			}
-			break
+			return
 		}
 		str := string(buf[:length])
-		if err := job.parseStatus(str, status); err != nil {
+		if err := j.parseStatus(str, status); err != nil {
 			log.Println("status parse failed", err)
 			return
 		}
-		job.parseSpeed(status)
-		if job.stallCount > 5 {
+		j.parseSpeed(status)
+		if j.stallCount > 5 {
 			log.Println("stall")
-			job.Stop()
+			return
 		}
 	}
 }
 
-func launch(parentCtx context.Context, name string, dirname string, overload <-chan Overload) (*Job, error) {
-	filename := path.Join(dirname, name+".sock")
+func (j *Job) start(exitNotify chan<- struct{}) {
+	j.wg.Add(1)
+	j.cmd.Stdout = os.Stdout
+	j.cmd.Stderr = os.Stderr
+
+	err := j.cmd.Start()
+	if err != nil {
+		log.Println(err)
+	}
+	defer j.cmd.Process.Signal(syscall.SIGTERM)
+
+	// stop job if command ends
+	go func() {
+		j.cmd.Wait()
+		j.stopped = true
+		j.cancel()
+		j.wg.Done()
+		select {
+		case exitNotify <- struct{}{}:
+		default:
+		}
+	}()
+
+	// wait for exit
+	<-j.ctx.Done()
+}
+
+func launch(parentCtx context.Context, name string, dirname string, cmd string, exitNotify chan<- struct{}) (*Job, error) {
 	ctx, cancel := context.WithCancel(parentCtx)
+	filename := path.Join(dirname, name+".sock")
+	args := append([]string{"-v", "warning", "-progress", "unix://" + filename}, flag.Args()...)
 	job := Job{
+		ctx:    ctx,
 		cancel: cancel,
 		Name:   name,
+		cmd:    exec.Command(cmd, args...),
 	}
 
 	ln, err := net.Listen("unix", filename)
@@ -113,37 +145,17 @@ func launch(parentCtx context.Context, name string, dirname string, overload <-c
 
 	// accept single connection
 	go func() {
+		defer os.Remove(filename)
+		defer ln.Close()
 		conn, err := ln.Accept()
+		job.wg.Add(1)
+		defer job.wg.Done()
 		if err != nil {
 			log.Println("accept failed:", err)
 		}
-		handleConnection(conn, &job, overload)
+		job.handleConnection(conn)
 	}()
+	go job.start(exitNotify)
 
-	go func() {
-		defer os.Remove(filename)
-		defer ln.Close()
-
-		args := append([]string{"-y", "-hide_banner", "-v", "warning", "-progress", "unix://" + filename}, os.Args[1:]...)
-
-		cmd := exec.Command("ffmpeg", args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		err = cmd.Start()
-		if err != nil {
-			log.Println(err)
-		}
-		defer cmd.Process.Kill()
-
-		// stop job if command ends
-		go func() {
-			cmd.Wait()
-			job.Stop()
-		}()
-
-		// wait for exit
-		<-ctx.Done()
-	}()
 	return &job, nil
 }
