@@ -6,48 +6,56 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"runtime"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
+const ResultQueueLength = 10000
+
+type limiterConfig struct {
+	auto  bool
+	limit int
+}
+
 func main() {
 	var segmentDuration = flag.Duration("segment-duration", time.Second*3, "segment duration")
-	var numWorkers = flag.Int("workers", runtime.NumCPU(), "number of downloader threads")
+	var numWorkers = flag.Int("workers", 50, "number of workers")
 	var limit = flag.Int64("limit", -1, "max requests per second, set to 0 for disable and -1 for auto")
 	var sample = flag.Uint("sample", 5, "segments between simulated clients")
+	var factor = flag.Uint("factor", 1, "client factor")
 	flag.Parse()
 	urls := flag.Args()
 	log.Printf("Fetching from %d playlist\n", len(urls))
 
-	tasks := make(chan *Task, 1)
-	limiter := make(chan struct{}, *numWorkers)
-	results := make(chan *Result, 1)
+	tasks := make(chan *Task, 50)
+	limiter := make(chan struct{}, *numWorkers*2)
+	results := make(chan *Result, ResultQueueLength)
 	iteration := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
+	var lastLimit atomic.Value
 
 	// Source routine
 	go func() {
-		ticker := time.NewTicker(*segmentDuration)
-		pl := NewPlaylistLoader(*sample, tasks, *segmentDuration)
+		pl := NewPlaylistLoader(*sample, *factor, tasks, *segmentDuration)
 		for {
 			for _, URL := range urls {
 				err := pl.Load(ctx, URL)
-				if err != nil {
+				if err != nil && !strings.HasSuffix(err.Error(), "context canceled") {
 					log.Println(err)
 				}
 			}
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			default:
 				iteration <- struct{}{}
 			}
 		}
 	}()
 
 	// Stats routine
-	count := make(chan uint64, 1)
 	go func() {
 		hits, timeouts, errors := uint64(0), uint64(0), uint64(0)
 		last := time.Now()
@@ -58,22 +66,19 @@ func main() {
 				return
 			case <-iteration:
 				now := time.Now()
-				timeFactor := float64(now.Sub(last) / time.Second)
+				timeFactor := float64(now.Sub(last)) / float64(time.Second)
 				last = now
 				bits := float64(bytes) / 1048576 * 8 / timeFactor
-				log.Printf("success: %d, timeouts: %d, error: %d, rate: %0.2f Mbit/s", hits, timeouts, errors, bits)
-				count <- uint64(hits + errors)
+				ops := float64(hits) / timeFactor
+				log.Printf("success: %d, timeouts: %d, error: %d, rate: %0.2f Mbit/s, ops: %0.2f Req/s",
+					hits, timeouts, errors, bits, ops)
+				lastLimit.Store(uint32(hits))
 				hits, timeouts, errors = 0, 0, 0
 				bytes = 0
 			case res := <-results:
-				bytes += res.Loaded
+				bytes += res.Size
 				if res.Err != nil {
-					if res.Err == context.DeadlineExceeded {
-						timeouts++
-					} else {
-						log.Println("Request error:", res.Err)
-						errors++
-					}
+					errors++
 				} else {
 					hits++
 				}
@@ -91,20 +96,23 @@ func main() {
 			auto = true
 			*limit = int64(len(urls) * 50 / int(*sample))
 		}
+		lastLimit.Store(uint32(*limit))
 		ticker := time.NewTicker(time.Second / time.Duration(*limit))
+		tickerReset := time.NewTicker(time.Second)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 				limiter <- struct{}{}
-			case total := <-count:
-				if total < 50 {
-					total = 50
+			case <-tickerReset.C:
+				limit := lastLimit.Load().(uint32)
+				if limit < 50 {
+					limit = 50
 				}
 				if auto {
 					ticker.Stop()
-					ticker = time.NewTicker(time.Second / time.Duration(float32(total)*1.2))
+					ticker = time.NewTicker(time.Second / time.Duration(float32(limit)*1.2))
 				}
 			}
 		}

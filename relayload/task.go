@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"time"
 )
 
@@ -10,10 +9,10 @@ import (
 type Task struct {
 	URL      string
 	Deadline time.Time
-	Context  context.Context
 }
 
 type Result struct {
-	Err    error
-	Loaded int64
+	Err  error
+	Code int
+	Size int64
 }

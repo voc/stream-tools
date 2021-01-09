@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
@@ -22,17 +21,25 @@ func NewDownloader(ctx context.Context, timeout time.Duration, tasks <-chan *Tas
 		},
 	}
 	go func() {
-		for task := range tasks {
-			// Skip old tasks
+		// fetch first task
+		task := <-tasks
+		for {
+			// limit download
 			select {
 			case <-ctx.Done():
 				return
-			case <-task.Context.Done():
-				continue
 			case <-limiter:
 			}
 			result := d.process(task)
 			results <- result
+
+			// fetch new task or reuse previous (playlist too short)
+			select {
+			case <-ctx.Done():
+				return
+			case task = <-tasks:
+			default:
+			}
 		}
 	}()
 	return d
@@ -40,22 +47,18 @@ func NewDownloader(ctx context.Context, timeout time.Duration, tasks <-chan *Tas
 
 func (d *Downloader) process(task *Task) *Result {
 	result := &Result{}
-	req, err := http.NewRequestWithContext(task.Context, "GET", task.URL, nil)
+	req, err := http.NewRequest("GET", task.URL, nil)
 	if err != nil {
 		result.Err = err
 		return result
 	}
 	resp, err := d.client.Do(req)
-	if err != nil {
-		result.Err = err
-		return result
+	if err == nil {
+		result.Size = resp.ContentLength
+		result.Code = resp.StatusCode
+		io.Copy(ioutil.Discard, resp.Body)
+		resp.Body.Close()
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		result.Err = fmt.Errorf("Got status %v", resp.Status)
-	}
-	bytes, err := io.Copy(ioutil.Discard, resp.Body)
-	result.Loaded = bytes
 	result.Err = err
 	return result
 }

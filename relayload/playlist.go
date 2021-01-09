@@ -17,16 +17,20 @@ import (
 	"github.com/zencoder/go-dash/mpd"
 )
 
+// PlaylistLoader for downloading/parsing segmented http live playlists
 type PlaylistLoader struct {
 	sample   uint
+	factor   uint
 	taskChan chan<- *Task
 	interval time.Duration
 	client   *http.Client
 }
 
-func NewPlaylistLoader(sample uint, taskChan chan<- *Task, interval time.Duration) *PlaylistLoader {
+// NewPlaylistLoader creates a new playlist loader
+func NewPlaylistLoader(sample uint, factor uint, taskChan chan<- *Task, interval time.Duration) *PlaylistLoader {
 	return &PlaylistLoader{
 		sample:   sample,
+		factor:   factor,
 		taskChan: taskChan,
 		interval: interval,
 		client: &http.Client{
@@ -36,14 +40,15 @@ func NewPlaylistLoader(sample uint, taskChan chan<- *Task, interval time.Duratio
 	}
 }
 
+// Load loads a playlist and creates Tasks for segment entries
 func (pl *PlaylistLoader) Load(parent context.Context, urlString string) error {
 	deadline := time.Now().Add(pl.interval)
-	ctx, _ := context.WithDeadline(parent, deadline)
+	ctx, cancel := context.WithDeadline(parent, deadline)
+	defer cancel()
 	return pl.get(ctx, urlString)
 }
 
 func (pl *PlaylistLoader) get(ctx context.Context, urlString string) error {
-
 	playlistURL, err := url.Parse(urlString)
 	if err != nil {
 		return err
@@ -79,6 +84,17 @@ var (
 	errNoSegmentTemplate        = errors.New("Dash Manifest loader requires Representations with SegmentTemplate for now")
 	errTimescaleMissing         = errors.New("Dash Manifest SegmentTemplate is missing timescale")
 )
+
+func (pl *PlaylistLoader) queue(ctx context.Context, task *Task) error {
+	for i := uint(0); i < pl.factor; i++ {
+		select {
+		case <-ctx.Done():
+			return errors.New("Capacity/Limit reached")
+		case pl.taskChan <- task:
+		}
+	}
+	return nil
+}
 
 // parseMpd parses DASH manifest and queues the segment download tasks
 func (pl *PlaylistLoader) parseMpd(ctx context.Context, reader io.Reader, playlistURL *url.URL) error {
@@ -136,13 +152,12 @@ func (pl *PlaylistLoader) parseMpd(ctx context.Context, reader io.Reader, playli
 					// Only fetch segments before the recommended presentation edge
 					if presentationEdge.After(ts) && offset%int64(pl.sample) == 0 {
 						name := dashSegmentName(segment, representation, offset)
-						segmentURL := fmt.Sprintf("%s://%s%s/%s", playlistURL.Scheme, playlistURL.Host, path.Dir(playlistURL.Path), name)
-						task := &Task{URL: segmentURL, Context: ctx}
-						select {
-						case <-ctx.Done():
-							return errors.New("Rate Limit reached")
-						case pl.taskChan <- task:
+						segmentURL := pl.getSubURL(playlistURL, name)
+						err := pl.queue(ctx, &Task{URL: segmentURL})
+						if err != nil {
+							return err
 						}
+
 					}
 					offset++
 					timestamp += segment.Duration
@@ -162,6 +177,18 @@ func dashSegmentName(s *mpd.SegmentTimelineSegment, r *mpd.Representation, offse
 	return strings.ReplaceAll(name, "$Number$", strconv.FormatInt(number, 10))
 }
 
+// getSubURL returns the URL to a playlist entry
+func (pl *PlaylistLoader) getSubURL(playlistURL *url.URL, subURI string) (subURL string) {
+	if strings.HasPrefix(subURI, "/") {
+		// absolute subURI
+		subURL = fmt.Sprintf("%s://%s%s", playlistURL.Scheme, playlistURL.Host, subURI)
+	} else {
+		// relative subURI
+		subURL = fmt.Sprintf("%s://%s%s/%s", playlistURL.Scheme, playlistURL.Host, path.Dir(playlistURL.Path), subURI)
+	}
+	return
+}
+
 // parseMpd parses m3u8 playlists and creates download tasks for all segments.
 // Can work with multi-quality master-playlists.
 func (pl *PlaylistLoader) parseM3u8(ctx context.Context, reader io.Reader, playlistURL *url.URL) error {
@@ -174,7 +201,7 @@ func (pl *PlaylistLoader) parseM3u8(ctx context.Context, reader io.Reader, playl
 		// Recursively fetch sub-playlists
 		for _, item := range playlist.Items {
 			if subPlaylist, ok := item.(*m3u8.PlaylistItem); ok {
-				subURL := fmt.Sprintf("%s://%s%s/%s", playlistURL.Scheme, playlistURL.Host, path.Dir(playlistURL.Path), subPlaylist.URI)
+				subURL := pl.getSubURL(playlistURL, subPlaylist.URI)
 				err := pl.get(ctx, subURL)
 				if err != nil {
 					return err
@@ -184,17 +211,15 @@ func (pl *PlaylistLoader) parseM3u8(ctx context.Context, reader io.Reader, playl
 	} else {
 		// Create tasks for segments in each playlist
 		segmentCount := playlist.SegmentSize()
-		offset := 0
+		offset := 1
 		for _, item := range playlist.Items {
 			if segment, ok := (item).(*m3u8.SegmentItem); ok {
 				// Don't rqeuest last 2 segments of a HLS playlist as per RFC
 				if offset < segmentCount-2 && offset%int(pl.sample) == 0 {
-					segmentURL := fmt.Sprintf("%s://%s%s/%s", playlistURL.Scheme, playlistURL.Host, path.Dir(playlistURL.Path), segment.Segment)
-					task := &Task{URL: segmentURL, Context: ctx}
-					select {
-					case <-ctx.Done():
-						return errors.New("Rate Limit reached")
-					case pl.taskChan <- task:
+					segmentURL := pl.getSubURL(playlistURL, segment.Segment)
+					err := pl.queue(ctx, &Task{URL: segmentURL})
+					if err != nil {
+						return err
 					}
 				}
 				offset++
