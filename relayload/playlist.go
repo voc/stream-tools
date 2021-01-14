@@ -17,6 +17,16 @@ import (
 	"github.com/zencoder/go-dash/mpd"
 )
 
+type SetAuthFunc func(*http.Request)
+
+type LoaderConfig struct {
+	sample   uint
+	factor   uint
+	taskChan chan<- *Task
+	interval time.Duration
+	authFunc SetAuthFunc
+}
+
 // PlaylistLoader for downloading/parsing segmented http live playlists
 type PlaylistLoader struct {
 	sample   uint
@@ -24,17 +34,19 @@ type PlaylistLoader struct {
 	taskChan chan<- *Task
 	interval time.Duration
 	client   *http.Client
+	setAuth  SetAuthFunc
 }
 
 // NewPlaylistLoader creates a new playlist loader
-func NewPlaylistLoader(sample uint, factor uint, taskChan chan<- *Task, interval time.Duration) *PlaylistLoader {
+func NewPlaylistLoader(config *LoaderConfig) *PlaylistLoader {
 	return &PlaylistLoader{
-		sample:   sample,
-		factor:   factor,
-		taskChan: taskChan,
-		interval: interval,
+		sample:   config.sample,
+		factor:   config.factor,
+		taskChan: config.taskChan,
+		interval: config.interval,
+		setAuth:  config.authFunc,
 		client: &http.Client{
-			Timeout: interval,
+			Timeout: config.interval,
 			// Transport: transport,
 		},
 	}
@@ -57,6 +69,7 @@ func (pl *PlaylistLoader) get(ctx context.Context, playlistURL *url.URL) error {
 	if err != nil {
 		return err
 	}
+	pl.setAuth(req)
 	resp, err := pl.client.Do(req)
 	if err != nil {
 		return err

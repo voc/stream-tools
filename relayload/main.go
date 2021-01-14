@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -12,12 +13,8 @@ import (
 	"time"
 )
 
+// ResultQueueLength max number of results to buffer
 const ResultQueueLength = 10000
-
-type limiterConfig struct {
-	auto  bool
-	limit int
-}
 
 func main() {
 	var segmentDuration = flag.Duration("segment-duration", time.Second*3, "segment duration")
@@ -25,6 +22,9 @@ func main() {
 	var limit = flag.Int64("limit", -1, "max requests per second, set to 0 for disable and -1 for auto")
 	var sample = flag.Uint("sample", 5, "segments between simulated clients")
 	var factor = flag.Uint("factor", 1, "client factor")
+	var auth = flag.String("auth", "", "auth type (basic)")
+	var user = flag.String("user", "", "auth username")
+	var password = flag.String("password", "", "auth password")
 	flag.Parse()
 	urls := flag.Args()
 	log.Printf("Fetching from %d playlist\n", len(urls))
@@ -36,9 +36,25 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	var lastLimit atomic.Value
 
+	var authFunc SetAuthFunc
+	if *auth == "basic" {
+		authFunc = func(req *http.Request) {
+			req.SetBasicAuth(*user, *password)
+		}
+	} else {
+		authFunc = func(req *http.Request) {}
+	}
+
 	// Source routine
 	go func() {
-		pl := NewPlaylistLoader(*sample, *factor, tasks, *segmentDuration)
+		loaderConfig := &LoaderConfig{
+			sample:   *sample,
+			factor:   *factor,
+			taskChan: tasks,
+			interval: *segmentDuration,
+			authFunc: authFunc,
+		}
+		pl := NewPlaylistLoader(loaderConfig)
 		for {
 			for _, URL := range urls {
 				err := pl.Load(ctx, URL)
@@ -50,6 +66,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			default:
+				time.Sleep(time.Millisecond * 20)
 				iteration <- struct{}{}
 			}
 		}
@@ -57,7 +74,7 @@ func main() {
 
 	// Stats routine
 	go func() {
-		hits, timeouts, errors := uint64(0), uint64(0), uint64(0)
+		hits, errors, fails := uint64(0), uint64(0), uint64(0)
 		last := time.Now()
 		bytes := int64(0)
 		for {
@@ -70,17 +87,21 @@ func main() {
 				last = now
 				bits := float64(bytes) / 1048576 * 8 / timeFactor
 				ops := float64(hits) / timeFactor
-				log.Printf("success: %d, timeouts: %d, error: %d, rate: %0.2f Mbit/s, ops: %0.2f Req/s",
-					hits, timeouts, errors, bits, ops)
+				log.Printf("success: %d, errors: %d, fails: %d, rate: %0.2f Mbit/s, ops: %0.2f Req/s",
+					hits, errors, fails, bits, ops)
 				lastLimit.Store(uint32(hits))
-				hits, timeouts, errors = 0, 0, 0
+				hits, errors, fails = 0, 0, 0
 				bytes = 0
 			case res := <-results:
 				bytes += res.Size
 				if res.Err != nil {
-					errors++
+					fails++
 				} else {
-					hits++
+					if res.Code == 200 {
+						hits++
+					} else {
+						errors++
+					}
 				}
 			}
 		}
@@ -119,7 +140,7 @@ func main() {
 	}()
 
 	// Spawn workers
-	d := NewDownloader(time.Second)
+	d := NewDownloader(*segmentDuration, authFunc)
 	d.RunWorkers(ctx, *numWorkers, tasks, limiter, results)
 
 	// signal handling

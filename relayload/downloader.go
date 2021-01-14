@@ -14,8 +14,9 @@ type Downloader struct {
 	request *http.Request
 }
 
-func NewDownloader(timeout time.Duration) *Downloader {
+func NewDownloader(timeout time.Duration, authFunc SetAuthFunc) *Downloader {
 	req, _ := http.NewRequest("GET", "", nil)
+	authFunc(req)
 	d := &Downloader{
 		timeout: timeout,
 		request: req,
