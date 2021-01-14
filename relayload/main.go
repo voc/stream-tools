@@ -21,7 +21,7 @@ type limiterConfig struct {
 
 func main() {
 	var segmentDuration = flag.Duration("segment-duration", time.Second*3, "segment duration")
-	var numWorkers = flag.Int("workers", 50, "number of workers")
+	var numWorkers = flag.Uint("workers", 50, "number of workers")
 	var limit = flag.Int64("limit", -1, "max requests per second, set to 0 for disable and -1 for auto")
 	var sample = flag.Uint("sample", 5, "segments between simulated clients")
 	var factor = flag.Uint("factor", 1, "client factor")
@@ -30,7 +30,7 @@ func main() {
 	log.Printf("Fetching from %d playlist\n", len(urls))
 
 	tasks := make(chan *Task, 50)
-	limiter := make(chan struct{}, *numWorkers*2)
+	limiter := make(chan struct{}, *numWorkers)
 	results := make(chan *Result, ResultQueueLength)
 	iteration := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,9 +119,8 @@ func main() {
 	}()
 
 	// Spawn workers
-	for i := 0; i < *numWorkers; i++ {
-		go NewDownloader(ctx, *segmentDuration, tasks, limiter, results)
-	}
+	d := NewDownloader(time.Second)
+	d.RunWorkers(ctx, *numWorkers, tasks, limiter, results)
 
 	// signal handling
 	c := make(chan os.Signal, 1)

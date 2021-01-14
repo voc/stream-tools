@@ -28,7 +28,7 @@ func TestPlaylistLoader_getSubURL(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := pl.getSubURL(baseURL, tt.subURI); got != tt.expected {
+			if got, err := pl.getSubURL(baseURL, tt.subURI); err != nil || got.String() != tt.expected {
 				t.Errorf("PlaylistLoader.getSubURL() got = %v, expected %v", got, tt.expected)
 			}
 		})

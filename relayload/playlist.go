@@ -34,8 +34,8 @@ func NewPlaylistLoader(sample uint, factor uint, taskChan chan<- *Task, interval
 		taskChan: taskChan,
 		interval: interval,
 		client: &http.Client{
-			Timeout:   interval,
-			Transport: transport,
+			Timeout: interval,
+			// Transport: transport,
 		},
 	}
 }
@@ -45,16 +45,15 @@ func (pl *PlaylistLoader) Load(parent context.Context, urlString string) error {
 	deadline := time.Now().Add(pl.interval)
 	ctx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
-	return pl.get(ctx, urlString)
-}
-
-func (pl *PlaylistLoader) get(ctx context.Context, urlString string) error {
 	playlistURL, err := url.Parse(urlString)
 	if err != nil {
 		return err
 	}
+	return pl.get(ctx, playlistURL)
+}
 
-	req, err := http.NewRequestWithContext(ctx, "GET", urlString, nil)
+func (pl *PlaylistLoader) get(ctx context.Context, playlistURL *url.URL) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", playlistURL.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -64,7 +63,7 @@ func (pl *PlaylistLoader) get(ctx context.Context, urlString string) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		log.Printf("Playlist %s: got %s\n", urlString, resp.Status)
+		log.Printf("Playlist %s: got %s\n", playlistURL.String(), resp.Status)
 		return nil
 	}
 	defer resp.Body.Close()
@@ -75,7 +74,7 @@ func (pl *PlaylistLoader) get(ctx context.Context, urlString string) error {
 	case ".m3u8":
 		return pl.parseM3u8(ctx, resp.Body, playlistURL)
 	default:
-		return fmt.Errorf("Unknown playlist format: '%v' for %v", path.Ext(playlistURL.Path), urlString)
+		return fmt.Errorf("Unknown playlist format: '%v' for %v", path.Ext(playlistURL.Path), playlistURL.String())
 	}
 }
 
@@ -89,7 +88,7 @@ func (pl *PlaylistLoader) queue(ctx context.Context, task *Task) error {
 	for i := uint(0); i < pl.factor; i++ {
 		select {
 		case <-ctx.Done():
-			return errors.New("Capacity/Limit reached")
+			return nil
 		case pl.taskChan <- task:
 		}
 	}
@@ -104,7 +103,6 @@ func (pl *PlaylistLoader) parseMpd(ctx context.Context, reader io.Reader, playli
 	}
 
 	if manifest.AvailabilityStartTime == nil {
-		log.Println("url", playlistURL)
 		return errAvailabilityStartMissing
 	}
 	avStart := *manifest.AvailabilityStartTime
@@ -152,8 +150,11 @@ func (pl *PlaylistLoader) parseMpd(ctx context.Context, reader io.Reader, playli
 					// Only fetch segments before the recommended presentation edge
 					if presentationEdge.After(ts) && offset%int64(pl.sample) == 0 {
 						name := dashSegmentName(segment, representation, offset)
-						segmentURL := pl.getSubURL(playlistURL, name)
-						err := pl.queue(ctx, &Task{URL: segmentURL})
+						segmentURL, err := pl.getSubURL(playlistURL, name)
+						if err != nil {
+							return err
+						}
+						err = pl.queue(ctx, &Task{URL: segmentURL})
 						if err != nil {
 							return err
 						}
@@ -178,14 +179,16 @@ func dashSegmentName(s *mpd.SegmentTimelineSegment, r *mpd.Representation, offse
 }
 
 // getSubURL returns the URL to a playlist entry
-func (pl *PlaylistLoader) getSubURL(playlistURL *url.URL, subURI string) (subURL string) {
+func (pl *PlaylistLoader) getSubURL(playlistURL *url.URL, subURI string) (subURL *url.URL, err error) {
+	var str string
 	if strings.HasPrefix(subURI, "/") {
 		// absolute subURI
-		subURL = fmt.Sprintf("%s://%s%s", playlistURL.Scheme, playlistURL.Host, subURI)
+		str = fmt.Sprintf("%s://%s%s", playlistURL.Scheme, playlistURL.Host, subURI)
 	} else {
 		// relative subURI
-		subURL = fmt.Sprintf("%s://%s%s/%s", playlistURL.Scheme, playlistURL.Host, path.Dir(playlistURL.Path), subURI)
+		str = fmt.Sprintf("%s://%s%s/%s", playlistURL.Scheme, playlistURL.Host, path.Dir(playlistURL.Path), subURI)
 	}
+	subURL, err = url.Parse(str)
 	return
 }
 
@@ -201,8 +204,11 @@ func (pl *PlaylistLoader) parseM3u8(ctx context.Context, reader io.Reader, playl
 		// Recursively fetch sub-playlists
 		for _, item := range playlist.Items {
 			if subPlaylist, ok := item.(*m3u8.PlaylistItem); ok {
-				subURL := pl.getSubURL(playlistURL, subPlaylist.URI)
-				err := pl.get(ctx, subURL)
+				subURL, err := pl.getSubURL(playlistURL, subPlaylist.URI)
+				if err != nil {
+					return err
+				}
+				err = pl.get(ctx, subURL)
 				if err != nil {
 					return err
 				}
@@ -216,8 +222,11 @@ func (pl *PlaylistLoader) parseM3u8(ctx context.Context, reader io.Reader, playl
 			if segment, ok := (item).(*m3u8.SegmentItem); ok {
 				// Don't rqeuest last 2 segments of a HLS playlist as per RFC
 				if offset < segmentCount-2 && offset%int(pl.sample) == 0 {
-					segmentURL := pl.getSubURL(playlistURL, segment.Segment)
-					err := pl.queue(ctx, &Task{URL: segmentURL})
+					segmentURL, err := pl.getSubURL(playlistURL, segment.Segment)
+					if err != nil {
+						return err
+					}
+					err = pl.queue(ctx, &Task{URL: segmentURL})
 					if err != nil {
 						return err
 					}
