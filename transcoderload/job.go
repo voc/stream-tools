@@ -68,7 +68,7 @@ func (j *Job) parseStatus(content string, status map[string]string) error {
 		}
 		split := strings.Split(line, "=")
 		if len(split) != 2 {
-			return fmt.Errorf("Invalid progress '%v'", line)
+			return fmt.Errorf("invalid progress '%v'", line)
 		}
 		status[split[0]] = split[1]
 	}
@@ -132,7 +132,14 @@ func (j *Job) start(exitNotify chan<- struct{}) {
 func launch(parentCtx context.Context, name string, dirname string, cmd string, exitNotify chan<- struct{}) (*Job, error) {
 	ctx, cancel := context.WithCancel(parentCtx)
 	filename := path.Join(dirname, name+".sock")
-	args := append([]string{"-v", "warning", "-progress", "unix://" + filename}, flag.Args()...)
+
+	// create arguments
+	args := []string{"-progress", "unix://" + filename}
+	if cmd == "ffmpeg" {
+		args = append(args, "-v", "warning")
+	}
+	args = append(args, flag.Args()...)
+
 	job := Job{
 		ctx:    ctx,
 		cancel: cancel,

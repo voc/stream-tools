@@ -7,73 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
-	"sync"
 	"syscall"
-	"time"
 )
-
-func run(ctx context.Context, wg *sync.WaitGroup, dirname string, cmd string) {
-	estimator := NewEstimator()
-	defer wg.Done()
-	defer estimator.PrintStats()
-
-	n := 1
-	timer := time.NewTimer(time.Second)
-	timer.Stop()
-	notify := make(chan struct{}, 1)
-	var jobs []*Job
-	for {
-		count, holdTime := estimator.Cycle()
-		diff := count - len(jobs)
-		log.Printf("count: %d, diff: %d, hold: %v", count, diff, holdTime)
-
-		for i := 0; i < diff; i++ {
-			// increase jobs
-			name := "ffmpeg" + strconv.Itoa(n)
-			n++
-			job, err := launch(ctx, name, dirname, cmd, notify)
-			if err != nil {
-				log.Fatal(err)
-			}
-			jobs = append(jobs, job)
-			log.Println("launched")
-			time.Sleep(time.Second)
-		}
-
-		timer.Reset(holdTime)
-
-		select {
-		case <-ctx.Done():
-			// exit
-			for i := 0; i < len(jobs); i++ {
-				jobs[i].Stop()
-			}
-			return
-		case <-notify:
-			if !timer.Stop() {
-				<-timer.C
-			}
-			// job did stall
-			for i := 0; i < len(jobs); i++ {
-				jobs[i].Stop()
-			}
-			jobs = []*Job{}
-			// drain notify
-			select {
-			case <-notify:
-			default:
-			}
-			estimator.Stall()
-			estimator.PrintStats()
-			continue
-		case <-timer.C:
-			// cycle ended without stall
-		}
-		estimator.Grow()
-		estimator.PrintStats()
-	}
-}
 
 func main() {
 	var cmd = flag.String("cmd", "ffmpeg", "command")
@@ -85,10 +20,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// run ffmpegs
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go run(ctx, &wg, dirname, *cmd)
+	// start running jobs
+	r := NewRunner(ctx, dirname, *cmd)
 
 	// signal handling
 	c := make(chan os.Signal, 1)
@@ -108,7 +41,7 @@ func main() {
 		}
 		// Cleanup
 		cancel()
-		wg.Wait()
+		r.Wait()
 		os.RemoveAll(dirname)
 		return
 	}
